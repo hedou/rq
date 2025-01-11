@@ -13,9 +13,10 @@ maintainers = [
     {name = "Selwin Ong"},
 ]
 authors = [
+    { name = "Selwin Ong", email = "selwin.ong@gmail.com" },
     { name = "Vincent Driessen", email = "vincent@3rdcloud.com" },
 ]
-requires-python = ">=3.7"
+requires-python = ">=3.8"
 classifiers = [
   "Development Status :: 5 - Production/Stable",
   "Intended Audience :: Developers",
@@ -29,11 +30,11 @@ classifiers = [
   "Operating System :: Unix",
   "Programming Language :: Python",
   "Programming Language :: Python :: 3 :: Only",
-  "Programming Language :: Python :: 3.7",
   "Programming Language :: Python :: 3.8",
   "Programming Language :: Python :: 3.9",
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
   "Topic :: Internet",
   "Topic :: Scientific/Engineering",
   "Topic :: Software Development :: Libraries :: Python Modules",
@@ -76,36 +77,53 @@ include = [
 
 [tool.hatch.envs.test]
 dependencies = [
-  "black",
   "coverage",
+  "mypy",
   "packaging",
   "psutil",
   "pytest",
   "pytest-cov",
   "ruff",
-  "sentry-sdk",
   "tox",
+  "types-greenlet",
+  "types-redis",
 ]
 [tool.hatch.envs.test.scripts]
 cov = "pytest --cov=rq --cov-config=.coveragerc --cov-report=xml {args:tests}"
+typing = "mypy --enable-incomplete-feature=Unpack rq"
 
-[tool.black]
-line-length = 120
-target-version = ["py38"]
-skip-string-normalization = true
+[tool.mypy]
+allow_redefinition = true
+pretty = true
+show_error_codes = true
+show_error_context = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_unreachable = true
+
+[[tool.mypy.overrides]]
+module = "setproctitle.*"
+ignore_missing_imports = true
 
 [tool.ruff]
 # Set what ruff should check for.
 # See https://beta.ruff.rs/docs/rules/ for a list of rules.
-select = [
+lint.select = [
     "E", # pycodestyle errors
     "F", # pyflakes errors
     "I", # import sorting
     "W", # pycodestyle warnings
 ]
-line-length = 120  # To match black.
+line-length = 120
 target-version = "py38"
 
-[tool.ruff.isort]
+[tool.ruff.lint.isort]
 known-first-party = ["rq"]
 section-order = ["future", "standard-library", "third-party", "first-party", "local-folder"]
+
+[tool.ruff.format]
+quote-style = "single"
+
+[tool.pyright]
+reportOptionalMemberAccess = false
+reportOptionalOperand = false

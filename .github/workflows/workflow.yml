@@ -2,7 +2,9 @@ name: Test
 
 on:
   push:
-    branches: [ master ]
+    branches:
+      - master
+      - '**'
   pull_request:
     branches: [ master ]
 
@@ -14,9 +16,9 @@ jobs:
     name: Run SSL tests
     runs-on: ubuntu-20.04
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     - name: Build the Docker test image for tox
-      uses: docker/build-push-action@v4
+      uses: docker/build-push-action@v6
       with:
         file: tests/Dockerfile
         tags: rqtest-image:latest
@@ -33,20 +35,20 @@ jobs:
     timeout-minutes: 10
     strategy:
       matrix:
-        python-version: ["3.7", "3.8", "3.9", "3.10", "3.11"]
-        redis-version: [3, 4, 5, 6, 7]
+        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13"]
+        redis-version: [4, 5, 6, 7]
         redis-py-version: [3.5.0]
 
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
 
     - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v4.7.1
+      uses: actions/setup-python@v5.3.0
       with:
         python-version: ${{ matrix.python-version }}
 
     - name: Start Redis
-      uses: supercharge/redis-github-action@1.6.0
+      uses: supercharge/redis-github-action@1.8.0
       with:
         redis-version: ${{ matrix.redis-version }}
 
@@ -61,7 +63,28 @@ jobs:
         RUN_SLOW_TESTS_TOO=1 hatch run test:cov --durations=5
 
     - name: Upload coverage to Codecov
-      uses: codecov/codecov-action@v4
+      uses: codecov/codecov-action@v5
       with:
         file: ./coverage.xml
         fail_ci_if_error: false
+
+  mypy:
+    runs-on: ubuntu-latest
+    name: Type check
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python 3.8
+      uses: actions/setup-python@v5.3.0
+      with:
+        python-version: "3.8"
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install hatch
+
+    - name: Run Test
+      run: |
+        hatch run test:typing

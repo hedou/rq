@@ -79,6 +79,9 @@ def get_redis_from_config(settings, connection_class=Redis):
         'ssl': ssl,
         'ssl_ca_certs': settings.get('REDIS_SSL_CA_CERTS', None),
         'ssl_cert_reqs': settings.get('REDIS_SSL_CERT_REQS', 'required'),
+        'ssl_ca_data': settings.get('REDIS_SSL_CA_DATA', None),
+        'ssl_keyfile': settings.get('REDIS_SSL_KEYFILE', None),
+        'ssl_certfile': settings.get('REDIS_SSL_CERTFILE', None),
     }
 
     return connection_class(**kwargs)
@@ -110,7 +113,7 @@ def state_symbol(state):
         return state
 
 
-def show_queues(queues, raw, by_queue, queue_class, worker_class):
+def show_queues(queues, raw, by_queue, queue_class, worker_class, connection: Redis):
     num_jobs = 0
     termwidth = get_terminal_size().columns
     chartwidth = min(20, termwidth - 20)
@@ -153,14 +156,14 @@ def show_queues(queues, raw, by_queue, queue_class, worker_class):
         click.echo('%d queues, %d jobs total' % (len(queues), num_jobs))
 
 
-def show_workers(queues, raw, by_queue, queue_class, worker_class):
+def show_workers(queues, raw, by_queue, queue_class, worker_class, connection: Redis):
     workers = set()
     if queues:
         for queue in queues:
-            for worker in worker_class.all(queue=queue):
+            for worker in worker_class.all(queue=queue, connection=connection):
                 workers.add(worker)
     else:
-        for worker in worker_class.all():
+        for worker in worker_class.all(connection=connection):
             workers.add(worker)
 
     if not by_queue:
@@ -190,16 +193,16 @@ def show_workers(queues, raw, by_queue, queue_class, worker_class):
         # Display workers by queue
         queue_dict = {}
         for queue in queues:
-            queue_dict[queue] = worker_class.all(queue=queue)
+            queue_dict[queue] = worker_class.all(queue=queue, connection=connection)
 
         if queue_dict:
-            max_length = max(len(q.name) for q, in queue_dict.keys())
+            max_length = max(len(q.name) for (q,) in queue_dict.keys())
         else:
             max_length = 0
 
         for queue in queue_dict:
             if queue_dict[queue]:
-                queues_str = ", ".join(
+                queues_str = ', '.join(
                     sorted(map(lambda w: '%s (%s)' % (w.name, state_symbol(w.get_state())), queue_dict[queue]))
                 )
             else:
@@ -210,11 +213,11 @@ def show_workers(queues, raw, by_queue, queue_class, worker_class):
         click.echo('%d workers, %d queues' % (len(workers), len(queues)))
 
 
-def show_both(queues, raw, by_queue, queue_class, worker_class):
-    show_queues(queues, raw, by_queue, queue_class, worker_class)
+def show_both(queues, raw, by_queue, queue_class, worker_class, connection: Redis):
+    show_queues(queues, raw, by_queue, queue_class, worker_class, connection)
     if not raw:
         click.echo('')
-    show_workers(queues, raw, by_queue, queue_class, worker_class)
+    show_workers(queues, raw, by_queue, queue_class, worker_class, connection)
     if not raw:
         click.echo('')
         import datetime
@@ -235,14 +238,15 @@ def refresh(interval, func, *args):
 
 def setup_loghandlers_from_args(verbose, quiet, date_format, log_format):
     if verbose and quiet:
-        raise RuntimeError("Flags --verbose and --quiet are mutually exclusive.")
+        raise RuntimeError('Flags --verbose and --quiet are mutually exclusive.')
 
     if verbose:
         level = 'DEBUG'
     elif quiet:
         level = 'WARNING'
     else:
-        level = 'INFO'
+        # Pass None not to set logging level explicitly
+        level = None
     setup_loghandlers(level, date_format=date_format, log_format=log_format)
 
 
@@ -309,7 +313,7 @@ def parse_function_args(arguments):
         keyword, value = parse_function_arg(argument, len(args) + 1)
         if keyword is not None:
             if keyword in kwargs:
-                raise click.BadParameter('You can\'t specify multiple values for the same keyword.')
+                raise click.BadParameter("You can't specify multiple values for the same keyword.")
             kwargs[keyword] = value
         else:
             args.append(value)
@@ -319,7 +323,7 @@ def parse_function_args(arguments):
 def parse_schedule(schedule_in, schedule_at):
     if schedule_in is not None:
         if schedule_at is not None:
-            raise click.BadArgumentUsage('You can\'t specify both --schedule-in and --schedule-at')
+            raise click.BadArgumentUsage("You can't specify both --schedule-in and --schedule-at")
         return datetime.now(timezone.utc) + timedelta(seconds=parse_timeout(schedule_in))
     elif schedule_at is not None:
         return datetime.strptime(schedule_at, '%Y-%m-%dT%H:%M:%S')
