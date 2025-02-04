@@ -11,8 +11,24 @@ import datetime as dt
 import importlib
 import logging
 import numbers
-from collections.abc import Iterable
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, TypeVar, Union
+
+# TODO: Change import path to "collections.abc" after we stop supporting Python 3.8
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Generator,
+    Iterable,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Type,
+    TypeVar,
+    Union,
+    overload,
+)
 
 if TYPE_CHECKING:
     from redis import Redis
@@ -23,14 +39,19 @@ from redis.exceptions import ResponseError
 
 from .exceptions import TimeoutFormatError
 
+_T = TypeVar('_T')
+_O = TypeVar('_O', bound=object)
+ObjOrStr = Union[_O, str]
+
+
 logger = logging.getLogger(__name__)
 
 
-def compact(lst: List[Any]) -> List[Any]:
+def compact(lst: Iterable[Optional[_T]]) -> List[_T]:
     """Excludes `None` values from a list-like object.
 
     Args:
-        lst (list): A list (or list-like) oject
+        lst (list): A list (or list-like) object
 
     Returns:
         object (list): The list without None values
@@ -48,7 +69,7 @@ def as_text(v: Union[bytes, str]) -> str:
         ValueError: If the value is not bytes or string
 
     Returns:
-        value (Optional[str]): Either the decoded string or None
+        value (str): The decoded string
     """
     if isinstance(v, bytes):
         return v.decode('utf-8')
@@ -58,7 +79,7 @@ def as_text(v: Union[bytes, str]) -> str:
         raise ValueError('Unknown type %r' % type(v))
 
 
-def decode_redis_hash(h) -> Dict[str, Any]:
+def decode_redis_hash(h: Dict[Union[bytes, str], _T]) -> Dict[str, _T]:
     """Decodes the Redis hash, ensuring that keys are strings
     Most importantly, decodes bytes strings, ensuring the dict has str keys.
 
@@ -68,7 +89,7 @@ def decode_redis_hash(h) -> Dict[str, Any]:
     Returns:
         Dict[str, Any]: The decoded Redis data (Dictionary)
     """
-    return dict((as_text(k), h[k]) for k in h)
+    return dict((as_text(k), v) for k, v in h.items())
 
 
 def import_attribute(name: str) -> Callable[..., Any]:
@@ -104,7 +125,7 @@ def import_attribute(name: str) -> Callable[..., Any]:
     if module is None:
         # maybe it's a builtin
         try:
-            return __builtins__[name]
+            return __builtins__[name]  # type: ignore[index]
         except KeyError:
             raise ValueError('Invalid attribute name: %s' % name)
 
@@ -124,11 +145,7 @@ def import_attribute(name: str) -> Callable[..., Any]:
     return getattr(attribute_owner, attribute_name)
 
 
-def utcnow():
-    return datetime.datetime.utcnow()
-
-
-def now():
+def now() -> datetime.datetime:
     """Return now in UTC"""
     return datetime.datetime.now(datetime.timezone.utc)
 
@@ -145,52 +162,10 @@ def utcparse(string: str) -> dt.datetime:
         return datetime.datetime.strptime(string, _TIMESTAMP_FORMAT)
     except ValueError:
         # This catches any jobs remain with old datetime format
-        return datetime.datetime.strptime(string, '%Y-%m-%dT%H:%M:%SZ')
-
-
-def first(iterable: Iterable, default=None, key=None):
-    """Return first element of `iterable` that evaluates true, else return None
-    (or an optional default value).
-
-    >>> first([0, False, None, [], (), 42])
-    42
-
-    >>> first([0, False, None, [], ()]) is None
-    True
-
-    >>> first([0, False, None, [], ()], default='ohai')
-    'ohai'
-
-    >>> import re
-    >>> m = first(re.match(regex, 'abc') for regex in ['b.*', 'a(.*)'])
-    >>> m.group(1)
-    'bc'
-
-    The optional `key` argument specifies a one-argument predicate function
-    like that used for `filter()`.  The `key` argument, if supplied, must be
-    in keyword form.  For example:
-
-    >>> first([1, 1, 3, 4, 5], key=lambda x: x % 2 == 0)
-    4
-
-    Args:
-        iterable (t.Iterable): _description_
-        default (_type_, optional): _description_. Defaults to None.
-        key (_type_, optional): _description_. Defaults to None.
-
-    Returns:
-        _type_: _description_
-    """
-    if key is None:
-        for el in iterable:
-            if el:
-                return el
-    else:
-        for el in iterable:
-            if key(el):
-                return el
-
-    return default
+        try:
+            return datetime.datetime.strptime(string, '%Y-%m-%dT%H:%M:%S.%fZ')
+        except ValueError:
+            return datetime.datetime.strptime(string, '%Y-%m-%dT%H:%M:%SZ')
 
 
 def is_nonstring_iterable(obj: Any) -> bool:
@@ -205,17 +180,23 @@ def is_nonstring_iterable(obj: Any) -> bool:
     return isinstance(obj, Iterable) and not isinstance(obj, str)
 
 
-def ensure_list(obj: Any) -> List:
-    """When passed an iterable of objects, does nothing, otherwise, it returns
+@overload
+def ensure_job_list(obj: ObjOrStr) -> List[ObjOrStr]: ...
+@overload
+def ensure_job_list(obj: Iterable[ObjOrStr]) -> List[ObjOrStr]: ...
+def ensure_job_list(obj):
+    """When passed an iterable of objects, convert to list, otherwise, it returns
     a list with just that object in it.
 
     Args:
         obj (Any): _description_
 
-    Returns:
+    returns:
         List: _description_
     """
-    return obj if is_nonstring_iterable(obj) else [obj]
+    # Note: To reuse is_nonstring_iterable, we need TypeGuard of Python 3.10+,
+    # but we are dragged by Python 3.8.
+    return list(obj) if isinstance(obj, Iterable) and not isinstance(obj, str) else [obj]
 
 
 def current_timestamp() -> int:
@@ -224,10 +205,10 @@ def current_timestamp() -> int:
     Returns:
         int: _description_
     """
-    return calendar.timegm(datetime.datetime.utcnow().utctimetuple())
+    return calendar.timegm(datetime.datetime.now(datetime.timezone.utc).utctimetuple())
 
 
-def backend_class(holder, default_name, override=None) -> TypeVar('T'):
+def backend_class(holder, default_name, override=None) -> Type:
     """Get a backend class using its default attribute name or an override
 
     Args:
@@ -241,14 +222,14 @@ def backend_class(holder, default_name, override=None) -> TypeVar('T'):
     if override is None:
         return getattr(holder, default_name)
     elif isinstance(override, str):
-        return import_attribute(override)
+        return import_attribute(override)  # type: ignore[return-value]
     else:
         return override
 
 
-def str_to_date(date_str: Optional[str]) -> Union[dt.datetime, Any]:
+def str_to_date(date_str: Optional[bytes]) -> Optional[dt.datetime]:
     if not date_str:
-        return
+        return None
     else:
         return utcparse(date_str.decode())
 
@@ -259,6 +240,7 @@ def parse_timeout(timeout: Optional[Union[int, float, str]]) -> Optional[int]:
         try:
             timeout = int(timeout)
         except ValueError:
+            assert isinstance(timeout, str)
             digit, unit = timeout[:-1], (timeout[-1:]).lower()
             unit_second = {'d': 86400, 'h': 3600, 'm': 60, 's': 1}
             try:
@@ -286,13 +268,19 @@ def get_version(connection: 'Redis') -> Tuple[int, int, int]:
     """
     try:
         # Getting the connection info for each job tanks performance, we can cache it on the connection object
-        if not getattr(connection, "__rq_redis_server_version", None):
+        if not getattr(connection, '__rq_redis_server_version', None):
+            # Cast the version string to a tuple of integers. Some Redis implementations may return a float.
+            version_str = str(connection.info('server')['redis_version'])
+            version_parts = [int(i) for i in version_str.split('.')[:3]]
+            # Ensure the version tuple has exactly three elements
+            while len(version_parts) < 3:
+                version_parts.append(0)
             setattr(
                 connection,
-                "__rq_redis_server_version",
-                tuple(int(i) for i in connection.info("server")["redis_version"].split('.')[:3]),
+                '__rq_redis_server_version',
+                tuple(version_parts),
             )
-        return getattr(connection, "__rq_redis_server_version")
+        return getattr(connection, '__rq_redis_server_version')
     except ResponseError:  # fakeredis doesn't implement Redis' INFO command
         return (5, 0, 9)
 
@@ -310,11 +298,11 @@ def ceildiv(a, b):
     return -(-a // b)
 
 
-def split_list(a_list: List[Any], segment_size: int):
+def split_list(a_list: Sequence[_T], segment_size: int) -> Generator[Sequence[_T], None, None]:
     """Splits a list into multiple smaller lists having size `segment_size`
 
     Args:
-        a_list (List[Any]): A list to split
+        a_list (Sequence[Any]): A sequence to split
         segment_size (int): The segment size to split into
 
     Yields:
@@ -348,13 +336,13 @@ def get_call_string(
     arguments with representation longer than max_length.
 
     Args:
-        func_name (str): The funtion name
+        func_name (str): The function name
         args (Any): The function arguments
         kwargs (Dict[Any, Any]): The function kwargs
         max_length (int, optional): The max length. Defaults to None.
 
     Returns:
-        str: A String representation of the function call.
+        str: A string representation of the function call.
     """
     if func_name is None:
         return None
@@ -368,8 +356,8 @@ def get_call_string(
     return '{0}({1})'.format(func_name, args)
 
 
-def parse_names(queues_or_names: List[Union[str, 'Queue']]) -> List[str]:
-    """Given a list of strings or queues, returns queue names"""
+def parse_names(queues_or_names: Iterable[Union[str, 'Queue']]) -> List[str]:
+    """Given a iterable  of strings or queues, returns queue names"""
     from .queue import Queue
 
     names = []
@@ -379,3 +367,13 @@ def parse_names(queues_or_names: List[Union[str, 'Queue']]) -> List[str]:
         else:
             names.append(str(queue_or_name))
     return names
+
+
+def get_connection_from_queues(queues_or_names: Iterable[Union[str, 'Queue']]) -> Optional['Redis']:
+    """Given a list of strings or queues, returns a connection"""
+    from .queue import Queue
+
+    for queue_or_name in queues_or_names:
+        if isinstance(queue_or_name, Queue):
+            return queue_or_name.connection
+    return None

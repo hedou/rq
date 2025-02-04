@@ -10,7 +10,7 @@ import sys
 import time
 import traceback
 import warnings
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from random import shuffle
 from types import FrameType
@@ -23,12 +23,18 @@ if TYPE_CHECKING:
     except ImportError:
         pass
     from redis import Redis
-    from redis.client import Pipeline, PubSub
+    from redis.client import Pipeline, PubSub, PubSubWorkerThread
 
 try:
     from signal import SIGKILL
 except ImportError:
     from signal import SIGTERM as SIGKILL
+
+try:
+    from signal import SIGRTMIN
+except ImportError:
+    # Use a fallback signal on platforms without SIGRTMIN
+    SIGRTMIN = signal.SIGUSR1
 
 from contextlib import suppress
 
@@ -36,7 +42,6 @@ import redis.exceptions
 
 from . import worker_registration
 from .command import PUBSUB_CHANNEL_TEMPLATE, handle_command, parse_payload
-from .connections import get_current_connection, pop_connection, push_connection
 from .defaults import (
     DEFAULT_JOB_MONITORING_INTERVAL,
     DEFAULT_LOGGING_DATE_FORMAT,
@@ -45,28 +50,42 @@ from .defaults import (
     DEFAULT_RESULT_TTL,
     DEFAULT_WORKER_TTL,
 )
-from .exceptions import DequeueTimeout, DeserializationError, ShutDownImminentException
-from .job import Job, JobStatus
+from .exceptions import DequeueTimeout, DeserializationError, InvalidJobOperation, ShutDownImminentException
+from .executions import Execution
+from .group import Group
+from .job import Job, JobStatus, Retry
 from .logutils import blue, green, setup_loghandlers, yellow
-from .maintenance import clean_intermediate_queue
 from .queue import Queue
 from .registry import StartedJobRegistry, clean_registries
 from .scheduler import RQScheduler
 from .serializers import resolve_serializer
 from .suspension import is_suspended
 from .timeouts import HorseMonitorTimeoutException, JobTimeoutException, UnixSignalDeathPenalty
-from .utils import as_text, backend_class, compact, ensure_list, get_version, utcformat, utcnow, utcparse
+from .utils import (
+    as_text,
+    backend_class,
+    compact,
+    ensure_job_list,
+    get_connection_from_queues,
+    get_version,
+    now,
+    utcformat,
+    utcparse,
+)
 from .version import VERSION
 
 try:
     from setproctitle import setproctitle as setprocname
 except ImportError:
 
-    def setprocname(*args, **kwargs):  # noqa
+    def setprocname(title: str) -> None:
         pass
 
 
-logger = logging.getLogger("rq.worker")
+# Set initial level to INFO.
+logger = logging.getLogger('rq.worker')
+if logger.level == logging.NOTSET:
+    logger.setLevel(logging.INFO)
 
 
 class StopRequested(Exception):
@@ -92,9 +111,9 @@ def signal_name(signum):
 
 
 class DequeueStrategy(str, Enum):
-    DEFAULT = "default"
-    ROUND_ROBIN = "round_robin"
-    RANDOM = "random"
+    DEFAULT = 'default'
+    ROUND_ROBIN = 'round_robin'
+    RANDOM = 'random'
 
 
 class WorkerStatus(str, Enum):
@@ -129,8 +148,9 @@ class BaseWorker:
         connection: Optional['Redis'] = None,
         exc_handler=None,
         exception_handlers=None,
-        default_worker_ttl=DEFAULT_WORKER_TTL,
         maintenance_interval: int = DEFAULT_MAINTENANCE_TASK_INTERVAL,
+        default_worker_ttl: Optional[int] = None,  # TODO remove this arg in 3.0
+        worker_ttl: Optional[int] = None,
         job_class: Optional[Type['Job']] = None,
         queue_class: Optional[Type['Queue']] = None,
         log_job_description: bool = True,
@@ -141,31 +161,46 @@ class BaseWorker:
         work_horse_killed_handler: Optional[Callable[[Job, int, int, 'struct_rusage'], None]] = None,
     ):  # noqa
         self.default_result_ttl = default_result_ttl
-        self.worker_ttl = default_worker_ttl
+
+        if worker_ttl:
+            self.worker_ttl = worker_ttl
+        elif default_worker_ttl:
+            warnings.warn('default_worker_ttl is deprecated, use worker_ttl.', DeprecationWarning, stacklevel=2)
+            self.worker_ttl = default_worker_ttl
+        else:
+            self.worker_ttl = DEFAULT_WORKER_TTL
+
         self.job_monitoring_interval = job_monitoring_interval
         self.maintenance_interval = maintenance_interval
 
+        if not connection:
+            connection = get_connection_from_queues(queues)
+
+        assert connection
         connection = self._set_connection(connection)
         self.connection = connection
         self.redis_server_version = None
 
         self.job_class = backend_class(self, 'job_class', override=job_class)
         self.queue_class = backend_class(self, 'queue_class', override=queue_class)
-        self.version = VERSION
-        self.python_version = sys.version
+        self.version: str = VERSION
+        self.python_version: str = sys.version
         self.serializer = resolve_serializer(serializer)
+        self.execution: Optional[Execution] = None
 
         queues = [
-            self.queue_class(
-                name=q,
-                connection=connection,
-                job_class=self.job_class,
-                serializer=self.serializer,
-                death_penalty_class=self.death_penalty_class,
+            (
+                self.queue_class(
+                    name=q,
+                    connection=connection,
+                    job_class=self.job_class,
+                    serializer=self.serializer,
+                    death_penalty_class=self.death_penalty_class,
+                )
+                if isinstance(q, str)
+                else q
             )
-            if isinstance(q, str)
-            else q
-            for q in ensure_list(queues)
+            for q in ensure_job_list(queues)
         ]
 
         self.name: str = name or uuid4().hex
@@ -193,7 +228,7 @@ class BaseWorker:
         self.scheduler: Optional[RQScheduler] = None
         self.pubsub: Optional['PubSub'] = None
         self.pubsub_thread = None
-        self._dequeue_strategy: DequeueStrategy = DequeueStrategy.DEFAULT
+        self._dequeue_strategy: Optional[DequeueStrategy] = DequeueStrategy.DEFAULT
 
         self.disable_default_exception_handler = disable_default_exception_handler
 
@@ -206,9 +241,11 @@ class BaseWorker:
                 warnings.warn('CLIENT SETNAME command not supported, setting ip_address to unknown', Warning)
                 self.ip_address = 'unknown'
             else:
-                client_adresses = [client['addr'] for client in connection.client_list() if client['name'] == self.name]
-                if len(client_adresses) > 0:
-                    self.ip_address = client_adresses[0]
+                client_addresses = [
+                    client['addr'] for client in connection.client_list() if client.get('name') == self.name
+                ]
+                if len(client_addresses) > 0:
+                    self.ip_address = client_addresses[0]
                 else:
                     warnings.warn('CLIENT LIST command not supported, setting ip_address to unknown', Warning)
                     self.ip_address = 'unknown'
@@ -227,7 +264,7 @@ class BaseWorker:
     def find_by_key(
         cls,
         worker_key: str,
-        connection: Optional['Redis'] = None,
+        connection: 'Redis',
         job_class: Optional[Type['Job']] = None,
         queue_class: Optional[Type['Queue']] = None,
         serializer=None,
@@ -253,8 +290,6 @@ class BaseWorker:
         if not worker_key.startswith(prefix):
             raise ValueError('Not a valid RQ worker key: %s' % worker_key)
 
-        if connection is None:
-            connection = get_current_connection()
         if not connection.exists(worker_key):
             connection.srem(cls.redis_workers_keys, worker_key)
             return None
@@ -281,7 +316,7 @@ class BaseWorker:
         queue_class: Optional[Type['Queue']] = None,
         queue: Optional['Queue'] = None,
         serializer=None,
-    ) -> List['Worker']:
+    ) -> List['BaseWorker']:
         """Returns an iterable of all Workers.
 
         Returns:
@@ -289,9 +324,8 @@ class BaseWorker:
         """
         if queue:
             connection = queue.connection
-        elif connection is None:
-            connection = get_current_connection()
 
+        assert connection
         worker_keys = worker_registration.get_keys(queue=queue, connection=connection)
         workers = [
             cls.find_by_key(
@@ -402,23 +436,22 @@ class BaseWorker:
         """Maintenance tasks should run on first startup or every 10 minutes."""
         if self.last_cleaned_at is None:
             return True
-        if (utcnow() - self.last_cleaned_at) > timedelta(seconds=self.maintenance_interval):
+        if (now() - self.last_cleaned_at) > timedelta(seconds=self.maintenance_interval):
             return True
         return False
 
-    def _set_connection(self, connection: Optional['Redis']) -> 'Redis':
-        """Configures the Redis connection to have a socket timeout.
-        This should timouet the connection in case any specific command hangs at any given time (eg. BLPOP).
-        If the connection provided already has a `socket_timeout` defined, skips.
+    def _set_connection(self, connection: 'Redis') -> 'Redis':
+        """Configures the Redis connection's socket timeout.
+        This will timeout the connection in case any specific command hangs at any given time (eg. BLPOP), but
+        also ensures that the timeout is long enough for those operations.
+        If the connection provided already has an adequate `socket_timeout` defined, skips.
 
         Args:
             connection (Optional[Redis]): The Redis Connection.
         """
-        if connection is None:
-            connection = get_current_connection()
-        current_socket_timeout = connection.connection_pool.connection_kwargs.get("socket_timeout")
-        if current_socket_timeout is None:
-            timeout_config = {"socket_timeout": self.connection_timeout}
+        current_socket_timeout = connection.connection_pool.connection_kwargs.get('socket_timeout')
+        if current_socket_timeout is None or current_socket_timeout < self.connection_timeout:
+            timeout_config = {'socket_timeout': self.connection_timeout}
             connection.connection_pool.connection_kwargs.update(timeout_config)
         return connection
 
@@ -437,10 +470,11 @@ class BaseWorker:
             # to run clean_registries().
             if queue.acquire_maintenance_lock():
                 self.log.info('Cleaning registries for queue: %s', queue.name)
-                clean_registries(queue)
+                clean_registries(queue, self._exc_handlers)
                 worker_registration.clean_worker_registry(queue)
-                clean_intermediate_queue(self, queue)
-        self.last_cleaned_at = utcnow()
+                queue.intermediate_queue.cleanup(self, queue)
+                queue.release_maintenance_lock()
+        self.last_cleaned_at = now()
 
     def get_redis_server_version(self):
         """Return Redis server version of connection"""
@@ -485,6 +519,42 @@ class BaseWorker:
         """Only supported by Redis server >= 5.0 is required."""
         return self.get_redis_server_version() >= (5, 0, 0)
 
+    def request_stop(self, signum, frame):
+        """Stops the current worker loop but waits for child processes to
+        end gracefully (warm shutdown).
+
+        Args:
+            signum (Any): Signum
+            frame (Any): Frame
+        """
+        self.log.debug('Got signal %s', signal_name(signum))
+        self._shutdown_requested_date = now()
+
+        signal.signal(signal.SIGINT, self.request_force_stop)
+        signal.signal(signal.SIGTERM, self.request_force_stop)
+
+        self.handle_warm_shutdown_request()
+        self._shutdown()
+
+    def _shutdown(self):
+        """
+        If shutdown is requested in the middle of a job, wait until
+        finish before shutting down and save the request in redis
+        """
+        if self.get_state() == WorkerStatus.BUSY:
+            self._stop_requested = True
+            self.set_shutdown_requested_date()
+            self.log.debug('Stopping after current horse is finished. Press Ctrl+C again for a cold shutdown.')
+            if self.scheduler:
+                self.stop_scheduler()
+        else:
+            if self.scheduler:
+                self.stop_scheduler()
+            raise StopRequested()
+
+    def request_force_stop(self, signum: int, frame: Optional[FrameType]):
+        raise NotImplementedError()
+
     def _install_signal_handlers(self):
         """Installs signal handlers for handling SIGINT and SIGTERM gracefully."""
         signal.signal(signal.SIGINT, self.request_stop)
@@ -497,7 +567,7 @@ class BaseWorker:
     def work(
         self,
         burst: bool = False,
-        logging_level: str = "INFO",
+        logging_level: Optional[str] = None,
         date_format: str = DEFAULT_LOGGING_DATE_FORMAT,
         log_format: str = DEFAULT_LOGGING_FORMAT,
         max_jobs: Optional[int] = None,
@@ -516,7 +586,8 @@ class BaseWorker:
 
         Args:
             burst (bool, optional): Whether to work on burst mode. Defaults to False.
-            logging_level (str, optional): Logging level to use. Defaults to "INFO".
+            logging_level (Optional[str], optional): Logging level to use.
+                If not provided, defaults to "INFO" unless a class-level logging level is already set.
             date_format (str, optional): Date Format. Defaults to DEFAULT_LOGGING_DATE_FORMAT.
             log_format (str, optional): Log Format. Defaults to DEFAULT_LOGGING_FORMAT.
             max_jobs (Optional[int], optional): Max number of jobs. Defaults to None.
@@ -584,6 +655,21 @@ class BaseWorker:
             self.teardown()
         return bool(completed_jobs)
 
+    def cleanup_execution(self, job: 'Job', pipeline: 'Pipeline'):
+        """Cleans up the execution of a job.
+        It will remove the job from the `StartedJobRegistry` and delete the Execution object.
+        """
+        self.log.debug('Cleaning up execution of job %s', job.id)
+        started_job_registry = StartedJobRegistry(
+            job.origin, self.connection, job_class=self.job_class, serializer=self.serializer
+        )
+        self.set_current_job_id(None, pipeline=pipeline)
+        started_job_registry.remove(job, pipeline=pipeline)
+        if self.execution:
+            started_job_registry.remove_execution(self.execution, job=job, pipeline=pipeline)
+            self.execution.delete(job=job, pipeline=pipeline)
+            self.execution = None
+
     def handle_warm_shutdown_request(self):
         self.log.info('Worker %s [PID %d]: warm shut down requested', self.name, self.pid)
 
@@ -598,9 +684,9 @@ class BaseWorker:
         if self._dequeue_strategy is None:
             self._dequeue_strategy = DequeueStrategy.DEFAULT
 
-        if self._dequeue_strategy not in ("default", "random", "round_robin"):
+        if self._dequeue_strategy not in ('default', 'random', 'round_robin'):
             raise ValueError(
-                f"Dequeue strategy {self._dequeue_strategy} is not allowed. Use `default`, `random` or `round_robin`."
+                f'Dequeue strategy {self._dequeue_strategy} is not allowed. Use `default`, `random` or `round_robin`.'
             )
         if self._dequeue_strategy == DequeueStrategy.DEFAULT:
             return
@@ -631,7 +717,7 @@ class BaseWorker:
             # check whether a job was stopped intentionally and set the job
             # status appropriately if it was this job.
             job_is_stopped = self._stopped_job_id == job.id
-            retry = job.retries_left and job.retries_left > 0 and not job_is_stopped
+            retry = job.should_retry and not job_is_stopped
 
             if job_is_stopped:
                 job.set_status(JobStatus.STOPPED, pipeline=pipeline)
@@ -641,14 +727,13 @@ class BaseWorker:
                 if not retry:
                     job.set_status(JobStatus.FAILED, pipeline=pipeline)
 
-            started_job_registry.remove(job, pipeline=pipeline)
+            self.cleanup_execution(job, pipeline=pipeline)
 
             if not self.disable_default_exception_handler and not retry:
                 job._handle_failure(exc_string, pipeline=pipeline)
                 with suppress(redis.exceptions.ConnectionError):
                     pipeline.execute()
 
-            self.set_current_job_id(None, pipeline=pipeline)
             self.increment_failed_job_count(pipeline)
             if job.started_at and job.ended_at:
                 self.increment_total_working_time(job.ended_at - job.started_at, pipeline)
@@ -732,7 +817,7 @@ class BaseWorker:
 
     def _set_state(self, state):
         """Raise a DeprecationWarning if ``worker.state = X`` is used"""
-        warnings.warn("worker.state is deprecated, use worker.set_state() instead.", DeprecationWarning)
+        warnings.warn('worker.state is deprecated, use worker.set_state() instead.', DeprecationWarning)
         self.set_state(state)
 
     def get_state(self) -> str:
@@ -740,7 +825,7 @@ class BaseWorker:
 
     def _get_state(self):
         """Raise a DeprecationWarning if ``worker.state == X`` is used"""
-        warnings.warn("worker.state is deprecated, use worker.get_state() instead.", DeprecationWarning)
+        warnings.warn('worker.state is deprecated, use worker.get_state() instead.', DeprecationWarning)
         return self.get_state()
 
     state = property(_get_state, _set_state)
@@ -748,13 +833,13 @@ class BaseWorker:
     def _start_scheduler(
         self,
         burst: bool = False,
-        logging_level: str = "INFO",
+        logging_level: Optional[str] = 'INFO',
         date_format: str = DEFAULT_LOGGING_DATE_FORMAT,
         log_format: str = DEFAULT_LOGGING_FORMAT,
     ):
         """Starts the scheduler process.
         This is specifically designed to be run by the worker when running the `work()` method.
-        Instanciates the RQScheduler and tries to acquire a lock.
+        Instantiates the RQScheduler and tries to acquire a lock.
         If the lock is acquired, start scheduler.
         If worker is on burst mode just enqueues scheduled jobs and quits,
         otherwise, starts the scheduler in a separate process.
@@ -768,7 +853,7 @@ class BaseWorker:
         self.scheduler = RQScheduler(
             self.queues,
             connection=self.connection,
-            logging_level=logging_level,
+            logging_level=logging_level if logging_level is not None else self.log.level,
             date_format=date_format,
             log_format=log_format,
             serializer=self.serializer,
@@ -791,9 +876,9 @@ class BaseWorker:
         queues = ','.join(self.queue_names())
         with self.connection.pipeline() as p:
             p.delete(key)
-            now = utcnow()
-            now_in_string = utcformat(now)
-            self.birth_date = now
+            right_now = now()
+            now_in_string = utcformat(right_now)
+            self.birth_date = right_now
 
             mapping = {
                 'birth': now_in_string,
@@ -806,11 +891,7 @@ class BaseWorker:
                 'python_version': self.python_version,
             }
 
-            if self.get_redis_server_version() >= (4, 0, 0):
-                p.hset(key, mapping=mapping)
-            else:
-                p.hmset(key, mapping)
-
+            p.hset(key, mapping=mapping)
             worker_registration.register(self, p)
             p.expire(key, self.worker_ttl + 60)
             p.execute()
@@ -822,20 +903,27 @@ class BaseWorker:
             # We cannot use self.state = 'dead' here, because that would
             # rollback the pipeline
             worker_registration.unregister(self, p)
-            p.hset(self.key, 'death', utcformat(utcnow()))
+            p.hset(self.key, 'death', utcformat(now()))
             p.expire(self.key, 60)
             p.execute()
 
+    @property
+    def horse_pid(self):
+        """The horse's process ID.  Only available in the worker.  Will return
+        0 in the horse part of the fork.
+        """
+        return self._horse_pid
+
     def bootstrap(
         self,
-        logging_level: str = "INFO",
+        logging_level: Optional[str] = 'INFO',
         date_format: str = DEFAULT_LOGGING_DATE_FORMAT,
         log_format: str = DEFAULT_LOGGING_FORMAT,
     ):
         """Bootstraps the worker.
         Runs the basic tasks that should run when the worker actually starts working.
         Used so that new workers can focus on the work loop implementation rather
-        than the full bootstraping process.
+        than the full bootstrapping process.
 
         Args:
             logging_level (str, optional): Logging level to use. Defaults to "INFO".
@@ -910,26 +998,80 @@ class BaseWorker:
             if self.scheduler and (not self.scheduler._process or not self.scheduler._process.is_alive()):
                 self.scheduler.acquire_locks(auto_start=True)
         self.clean_registries()
+        Group.clean_registries(connection=self.connection)
+
+    def _pubsub_exception_handler(self, exc: Exception, pubsub: 'PubSub', pubsub_thread: 'PubSubWorkerThread') -> None:
+        """
+        This exception handler allows the pubsub_thread to continue & retry to
+        connect after a connection problem the same way the main worker loop
+        indefinitely retries.
+        redis-py internal mechanism will restore the channels subscriptions
+        once the connection is re-established.
+        """
+        if isinstance(exc, (redis.exceptions.ConnectionError)):
+            self.log.error(
+                'Could not connect to Redis instance: %s Retrying in %d seconds...',
+                exc,
+                2,
+            )
+            time.sleep(2.0)
+        else:
+            self.log.warning('Pubsub thread exiting on %s', exc)
+            raise
+
+    def handle_payload(self, message):
+        """Handle external commands"""
+        self.log.debug('Received message: %s', message)
+        payload = parse_payload(message)
+        handle_command(self, payload)
 
     def subscribe(self):
         """Subscribe to this worker's channel"""
         self.log.info('Subscribing to channel %s', self.pubsub_channel_name)
         self.pubsub = self.connection.pubsub()
         self.pubsub.subscribe(**{self.pubsub_channel_name: self.handle_payload})
-        self.pubsub_thread = self.pubsub.run_in_thread(sleep_time=0.2, daemon=True)
+        self.pubsub_thread = self.pubsub.run_in_thread(
+            sleep_time=None, daemon=True, exception_handler=self._pubsub_exception_handler
+        )
+
+    def get_heartbeat_ttl(self, job: 'Job') -> int:
+        """Get's the TTL for the next heartbeat.
+
+        Args:
+            job (Job): The Job
+
+        Returns:
+            int: The heartbeat TTL.
+        """
+        if job.timeout and job.timeout > 0:
+            remaining_execution_time = job.timeout - self.current_job_working_time
+            return int(min(remaining_execution_time, self.job_monitoring_interval)) + 60
+        else:
+            return self.job_monitoring_interval + 60
+
+    def prepare_execution(self, job: 'Job') -> Execution:
+        """This method is called by the main `Worker` (not the horse) as it prepares for execution.
+        Do not confuse this with worker.prepare_job_execution() which is called by the horse.
+        """
+        with self.connection.pipeline() as pipeline:
+            heartbeat_ttl = self.get_heartbeat_ttl(job)
+            self.execution = Execution.create(job, heartbeat_ttl, pipeline=pipeline)
+            self.set_state(WorkerStatus.BUSY, pipeline=pipeline)
+            pipeline.execute()
+        return self.execution
 
     def unsubscribe(self):
         """Unsubscribe from pubsub channel"""
         if self.pubsub_thread:
             self.log.info('Unsubscribing from channel %s', self.pubsub_channel_name)
-            self.pubsub_thread.stop()
-            self.pubsub_thread.join()
             self.pubsub.unsubscribe()
+            self.pubsub_thread.stop()
+            self.pubsub_thread.join(timeout=1)
             self.pubsub.close()
 
     def dequeue_job_and_maintain_ttl(
         self, timeout: Optional[int], max_idle_time: Optional[int] = None
-    ) -> Tuple['Job', 'Queue']:
+    ) -> Optional[Tuple['Job', 'Queue']]:
         """Dequeues a job while maintaining the TTL.
 
         Returns:
@@ -942,7 +1084,7 @@ class BaseWorker:
         self.procline('Listening on ' + qnames)
         self.log.debug('*** Listening on %s...', green(qnames))
         connection_wait_time = 1.0
-        idle_since = utcnow()
+        idle_since = now()
         idle_time_left = max_idle_time
         while True:
             try:
@@ -976,7 +1118,7 @@ class BaseWorker:
                 break
             except DequeueTimeout:
                 if max_idle_time is not None:
-                    idle_for = (utcnow() - idle_since).total_seconds()
+                    idle_for = (now() - idle_since).total_seconds()
                     idle_time_left = math.ceil(max_idle_time - idle_for)
                     if idle_time_left <= 0:
                         break
@@ -987,8 +1129,6 @@ class BaseWorker:
                 time.sleep(connection_wait_time)
                 connection_wait_time *= self.exponential_backoff_factor
                 connection_wait_time = min(connection_wait_time, self.max_connection_wait_time)
-            else:
-                connection_wait_time = 1.0
 
         self.heartbeat()
         return result
@@ -1011,7 +1151,7 @@ class BaseWorker:
         timeout = timeout or self.worker_ttl + 60
         connection: Union[Redis, 'Pipeline'] = pipeline if pipeline is not None else self.connection
         connection.expire(self.key, timeout)
-        connection.hset(self.key, 'last_heartbeat', utcformat(utcnow()))
+        connection.hset(self.key, 'last_heartbeat', utcformat(now()))
         self.log.debug('Sent heartbeat to prevent worker timeout. Next one should arrive in %s seconds.', timeout)
 
     def teardown(self):
@@ -1056,7 +1196,7 @@ class BaseWorker:
 
     def increment_total_working_time(self, job_execution_time: timedelta, pipeline: 'Pipeline'):
         """Used to keep the worker stats up to date in Redis.
-        Increments the time the worker has been workig for (in seconds).
+        Increments the time the worker has been working for (in seconds).
 
         Args:
             job_execution_time (timedelta): A timedelta object.
@@ -1073,11 +1213,7 @@ class BaseWorker:
         self.log.debug('Handling exception for %s.', job.id)
         exc_string = ''.join(traceback.format_exception(*exc_info))
         try:
-            extra = {
-                'func': job.func_name,
-                'arguments': job.args,
-                'kwargs': job.kwargs,
-            }
+            extra = {'func': job.func_name, 'arguments': job.args, 'kwargs': job.kwargs}
             func_name = job.func_name
         except DeserializationError:
             extra = {}
@@ -1107,15 +1243,11 @@ class BaseWorker:
         """Pushes an exception handler onto the exc handler stack."""
         self._exc_handlers.append(handler_func)
 
+    def kill_horse(self, sig: signal.Signals = SIGKILL):
+        raise NotImplementedError()
+
 
 class Worker(BaseWorker):
-    @property
-    def horse_pid(self):
-        """The horse's process ID.  Only available in the worker.  Will return
-        0 in the horse part of the fork.
-        """
-        return self._horse_pid
-
     @property
     def is_horse(self):
         """Returns whether or not this is the worker or the work horse."""
@@ -1160,7 +1292,7 @@ class Worker(BaseWorker):
         # One is sent by the pool when it calls `pool.stop_worker()` and another is sent by the OS
         # when user hits Ctrl+C. In this case if we receive the second signal within 1 second,
         # we ignore it.
-        if (utcnow() - self._shutdown_requested_date) < timedelta(seconds=1):  # type: ignore
+        if (now() - self._shutdown_requested_date) < timedelta(seconds=1):  # type: ignore
             self.log.debug('Shutdown signal ignored, received twice in less than 1 second')
             return
 
@@ -1172,39 +1304,6 @@ class Worker(BaseWorker):
             self.kill_horse()
             self.wait_for_horse()
         raise SystemExit()
-
-    def request_stop(self, signum, frame):
-        """Stops the current worker loop but waits for child processes to
-        end gracefully (warm shutdown).
-
-        Args:
-            signum (Any): Signum
-            frame (Any): Frame
-        """
-        self.log.debug('Got signal %s', signal_name(signum))
-        self._shutdown_requested_date = utcnow()
-
-        signal.signal(signal.SIGINT, self.request_force_stop)
-        signal.signal(signal.SIGTERM, self.request_force_stop)
-
-        self.handle_warm_shutdown_request()
-        self._shutdown()
-
-    def _shutdown(self):
-        """
-        If shutdown is requested in the middle of a job, wait until
-        finish before shutting down and save the request in redis
-        """
-        if self.get_state() == WorkerStatus.BUSY:
-            self._stop_requested = True
-            self.set_shutdown_requested_date()
-            self.log.debug('Stopping after current horse is finished. Press Ctrl+C again for a cold shutdown.')
-            if self.scheduler:
-                self.stop_scheduler()
-        else:
-            if self.scheduler:
-                self.stop_scheduler()
-            raise StopRequested()
 
     def fork_work_horse(self, job: 'Job', queue: 'Queue'):
         """Spawns a work horse to perform the actual work and passes it a job.
@@ -1250,7 +1349,7 @@ class Worker(BaseWorker):
             queue (Queue): _description_
         """
         retpid = ret_val = rusage = None
-        job.started_at = utcnow()
+        job.started_at = now()
         while True:
             try:
                 with self.death_penalty_class(self.job_monitoring_interval, HorseMonitorTimeoutException):
@@ -1259,7 +1358,7 @@ class Worker(BaseWorker):
             except HorseMonitorTimeoutException:
                 # Horse has not exited yet and is still running.
                 # Send a heartbeat to keep the worker alive.
-                self.set_current_job_working_time((utcnow() - job.started_at).total_seconds())
+                self.set_current_job_working_time((now() - job.started_at).total_seconds())
 
                 # Kill the job from this side if something is really wrong (interpreter lock/etc).
                 if job.timeout != -1 and self.current_job_working_time > (job.timeout + 60):  # type: ignore
@@ -1287,11 +1386,12 @@ class Worker(BaseWorker):
         if ret_val == os.EX_OK:  # The process exited normally.
             return
 
-        job_status = job.get_status()
+        try:
+            job_status = job.get_status()
+        except InvalidJobOperation:
+            return  # Job completed and its ttl has expired
 
-        if job_status is None:  # Job completed and its ttl has expired
-            return
-        elif self._stopped_job_id == job.id:
+        if self._stopped_job_id == job.id:
             # Work-horse killed deliberately
             self.log.warning('Job stopped by user, moving job to FailedJobRegistry')
             if job.stopped_callback:
@@ -1299,11 +1399,11 @@ class Worker(BaseWorker):
             self.handle_job_failure(job, queue=queue, exc_string='Job stopped by user, work-horse terminated.')
         elif job_status not in [JobStatus.FINISHED, JobStatus.FAILED]:
             if not job.ended_at:
-                job.ended_at = utcnow()
+                job.ended_at = now()
 
             # Unhandled failure: move the job to the failed queue
-            signal_msg = f" (signal {os.WTERMSIG(ret_val)})" if ret_val and os.WIFSIGNALED(ret_val) else ''
-            exc_string = f"Work-horse terminated unexpectedly; waitpid returned {ret_val}{signal_msg}; "
+            signal_msg = f' (signal {os.WTERMSIG(ret_val)})' if ret_val and os.WIFSIGNALED(ret_val) else ''
+            exc_string = f'Work-horse terminated unexpectedly; waitpid returned {ret_val}{signal_msg}; '
             self.log.warning('Moving job to FailedJobRegistry (%s)', exc_string)
 
             self.handle_work_horse_killed(job, retpid, ret_val, rusage)
@@ -1315,30 +1415,34 @@ class Worker(BaseWorker):
         within the given timeout bounds, or will end the work horse with
         SIGALRM.
         """
-        self.set_state(WorkerStatus.BUSY)
+        self.prepare_execution(job)
         self.fork_work_horse(job, queue)
         self.monitor_work_horse(job, queue)
         self.set_state(WorkerStatus.IDLE)
 
     def maintain_heartbeats(self, job: 'Job'):
-        """Updates worker and job's last heartbeat field. If job was
-        enqueued with `result_ttl=0`, a race condition could happen where this heartbeat
-        arrives after job has been deleted, leaving a job key that contains only
-        `last_heartbeat` field.
-
-        hset() is used when updating job's timestamp. This command returns 1 if a new
-        Redis key is created, 0 otherwise. So in this case we check the return of job's
-        heartbeat() command. If a new key was created, this means the job was already
-        deleted. In this case, we simply send another delete command to remove the key.
-
-        https://github.com/rq/rq/issues/1450
-        """
+        """Updates worker, execution and job's last heartbeat fields."""
         with self.connection.pipeline() as pipeline:
             self.heartbeat(self.job_monitoring_interval + 60, pipeline=pipeline)
-            ttl = self.get_heartbeat_ttl(job)
-            job.heartbeat(utcnow(), ttl, pipeline=pipeline, xx=True)
+            ttl = int(self.get_heartbeat_ttl(job))
+
+            # Also need to update execution's heartbeat
+            self.execution.heartbeat(job.started_job_registry, ttl, pipeline=pipeline)  # type: ignore
+            # After transition to job execution is complete, `job.heartbeat()` is no longer needed
+            job.heartbeat(now(), ttl, pipeline=pipeline, xx=True)
             results = pipeline.execute()
-            if results[2] == 1:
+
+            # If job was enqueued with `result_ttl=0` (job is deleted as soon as it finishes),
+            # a race condition could happen where heartbeat arrives after job has been deleted,
+            # leaving a job key that contains only `last_heartbeat` field.
+
+            # job.heartbeat() uses hset() to update job's timestamp. This command returns 1 if a new
+            # Redis key is created, 0 otherwise. So in this case we check the return of job's
+            # heartbeat() command. If a new key was created, this means the job was already
+            # deleted. In this case, we simply send another delete command to remove the key.
+            # https://github.com/rq/rq/issues/1450
+
+            if results[7] == 1:
                 self.connection.delete(job.key)
 
     def main_work_horse(self, job: 'Job', queue: 'Queue'):
@@ -1372,7 +1476,7 @@ class Worker(BaseWorker):
         signal.signal(signal.SIGINT, signal.SIG_IGN)
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
 
-    def prepare_job_execution(self, job: 'Job', remove_from_intermediate_queue: bool = False):
+    def prepare_job_execution(self, job: 'Job', remove_from_intermediate_queue: bool = False) -> None:
         """Performs misc bookkeeping like updating states prior to
         job execution.
         """
@@ -1383,7 +1487,7 @@ class Worker(BaseWorker):
 
             heartbeat_ttl = self.get_heartbeat_ttl(job)
             self.heartbeat(heartbeat_ttl, pipeline=pipeline)
-            job.heartbeat(utcnow(), heartbeat_ttl, pipeline=pipeline)
+            job.heartbeat(now(), heartbeat_ttl, pipeline=pipeline)
 
             job.prepare_for_execution(self.name, pipeline=pipeline)
             if remove_from_intermediate_queue:
@@ -1396,6 +1500,57 @@ class Worker(BaseWorker):
 
         msg = 'Processing {0} from {1} since {2}'
         self.procline(msg.format(job.func_name, job.origin, time.time()))
+
+    def handle_job_retry(self, job: 'Job', queue: 'Queue', retry: Retry, started_job_registry: StartedJobRegistry):
+        """Handles the retry of certain job.
+        It will remove the job from the `StartedJobRegistry` and requeue or reschedule the job.
+
+        Args:
+            job (Job): The job that will be retried.
+            queue (Queue): The queue
+            started_job_registry (StartedJobRegistry): The started registry
+        """
+        self.log.debug('Handling retry of job %s', job.id)
+
+        # Check if job has exceeded max retries
+        if job.number_of_retries and job.number_of_retries >= retry.max:
+            # If max retries exceeded, treat as failure
+            self.log.warning('Job %s has exceeded maximum retry attempts (%d)', job.id, retry.max)
+            exc_string = f'Job failed after {retry.max} retry attempts'
+            self.handle_job_failure(job, queue=queue, exc_string=exc_string)
+            return
+
+        # Calculate retry interval based on retry count
+        retry_interval = Retry.get_interval(job.number_of_retries or 0, retry.intervals)
+
+        with self.connection.pipeline() as pipeline:
+            self.increment_failed_job_count(pipeline=pipeline)
+            self.increment_total_working_time(job.ended_at - job.started_at, pipeline)  # type: ignore
+
+            if retry_interval > 0:
+                # Schedule job for later if there's an interval
+                scheduled_time = datetime.now(timezone.utc) + timedelta(seconds=retry_interval)
+                job.set_status(JobStatus.SCHEDULED, pipeline=pipeline)
+                queue.schedule_job(job, scheduled_time, pipeline=pipeline)
+                self.log.debug(
+                    'Job %s: scheduled for retry at %s, %s attempts remaining',
+                    job.id,
+                    scheduled_time,
+                    retry.max - (job.number_of_retries or 0),
+                )
+            else:
+                self.log.debug(
+                    'Job %s: enqueued for retry, %s attempts remaining',
+                    job.id,
+                    retry.max - (job.number_of_retries or 0),
+                )
+                job._handle_retry_result(queue=queue, pipeline=pipeline)
+
+            self.cleanup_execution(job, pipeline=pipeline)
+
+            pipeline.execute()
+
+            self.log.debug('Finished handling retry of job %s', job.id)
 
     def handle_job_success(self, job: 'Job', queue: 'Queue', started_job_registry: StartedJobRegistry):
         """Handles the successful execution of certain job.
@@ -1430,24 +1585,39 @@ class Worker(BaseWorker):
                         # We have to do it ourselves to make sure everything runs in a transaction
                         pipeline.multi()
 
-                    self.set_current_job_id(None, pipeline=pipeline)
                     self.increment_successful_job_count(pipeline=pipeline)
                     self.increment_total_working_time(job.ended_at - job.started_at, pipeline)  # type: ignore
 
                     result_ttl = job.get_result_ttl(self.default_result_ttl)
                     if result_ttl != 0:
-                        self.log.debug('Saving job %s\'s successful execution result', job.id)
+                        self.log.debug("Saving job %s's successful execution result", job.id)
                         job._handle_success(result_ttl, pipeline=pipeline)
 
                     job.cleanup(result_ttl, pipeline=pipeline, remove_from_queue=False)
                     self.log.debug('Removing job %s from StartedJobRegistry', job.id)
-                    started_job_registry.remove(job, pipeline=pipeline)
+                    self.cleanup_execution(job, pipeline=pipeline)
+                    # self.set_current_job_id(None, pipeline=pipeline)
+                    # started_job_registry.remove(job, pipeline=pipeline)
+                    # self.execution.delete(pipeline)  # type: ignore
 
                     pipeline.execute()
+
+                    assert job.started_at
+                    assert job.ended_at
+                    time_taken = job.ended_at - job.started_at
+                    self.log.info(
+                        'Successfully completed %s job in %ss on worker %s', job.description, time_taken, self.name
+                    )
+
                     self.log.debug('Finished handling successful execution of job %s', job.id)
                     break
                 except redis.exceptions.WatchError:
                     continue
+
+    def handle_execution_ended(self, job: 'Job', queue: 'Queue', heartbeat_ttl: int):
+        """Called after job has finished execution."""
+        job.ended_at = now()
+        job.heartbeat(now(), heartbeat_ttl)
 
     def perform_job(self, job: 'Job', queue: 'Queue') -> bool:
         """Performs the actual work of a job.  Will/should only be called
@@ -1460,7 +1630,6 @@ class Worker(BaseWorker):
         Returns:
             bool: True after finished.
         """
-        push_connection(self.connection)
         started_job_registry = queue.started_job_registry
         self.log.debug('Started Job Registry set.')
 
@@ -1468,48 +1637,55 @@ class Worker(BaseWorker):
             remove_from_intermediate_queue = len(self.queues) == 1
             self.prepare_job_execution(job, remove_from_intermediate_queue)
 
-            job.started_at = utcnow()
+            job.started_at = now()
             timeout = job.timeout or self.queue_class.DEFAULT_TIMEOUT
             with self.death_penalty_class(timeout, JobTimeoutException, job_id=job.id):
-                self.log.debug('Performing Job...')
-                rv = job.perform()
-                self.log.debug('Finished performing Job ID %s', job.id)
+                self.log.debug('Performing Job %s ...', job.id)
+                return_value = job.perform()
+                self.log.debug('Finished performing Job %s', job.id)
 
-            job.ended_at = utcnow()
-
+            self.handle_execution_ended(job, queue, job.success_callback_timeout)
             # Pickle the result in the same try-except block since we need
             # to use the same exc handling when pickling fails
-            job._result = rv
+            job._result = return_value
 
-            job.heartbeat(utcnow(), job.success_callback_timeout)
-            job.execute_success_callback(self.death_penalty_class, rv)
+            if isinstance(return_value, Retry):
+                # Retry the job
+                self.log.debug('Job %s returns a Retry object', job.id)
+                self.handle_job_retry(
+                    job=job, queue=queue, retry=return_value, started_job_registry=started_job_registry
+                )
+                return True
+            else:
+                job.execute_success_callback(self.death_penalty_class, return_value)
+                self.handle_job_success(job=job, queue=queue, started_job_registry=started_job_registry)
 
-            self.handle_job_success(job=job, queue=queue, started_job_registry=started_job_registry)
         except:  # NOQA
             self.log.debug('Job %s raised an exception.', job.id)
-            job.ended_at = utcnow()
+            job._status = JobStatus.FAILED
+
+            self.handle_execution_ended(job, queue, job.failure_callback_timeout)
             exc_info = sys.exc_info()
             exc_string = ''.join(traceback.format_exception(*exc_info))
 
             try:
-                job.heartbeat(utcnow(), job.failure_callback_timeout)
                 job.execute_failure_callback(self.death_penalty_class, *exc_info)
             except:  # noqa
                 exc_info = sys.exc_info()
                 exc_string = ''.join(traceback.format_exception(*exc_info))
 
+            # TODO: reversing the order of handle_job_failure() and handle_exception()
+            # causes Sentry test to fail
+            self.handle_exception(job, *exc_info)
             self.handle_job_failure(
                 job=job, exc_string=exc_string, queue=queue, started_job_registry=started_job_registry
             )
-            self.handle_exception(job, *exc_info)
+
             return False
 
-        finally:
-            pop_connection()
-
         self.log.info('%s: %s (%s)', green(job.origin), blue('Job OK'), job.id)
-        if rv is not None:
-            self.log.debug('Result: %r', yellow(as_text(str(rv))))
+        if return_value is not None:
+            self.log.debug('Result: %r', yellow(str(return_value)))
 
         if self.log_result_lifespan:
             result_ttl = job.get_result_ttl(self.default_result_ttl)
@@ -1542,17 +1718,55 @@ class Worker(BaseWorker):
         """The hash does not take the database/connection into account"""
         return hash(self.name)
 
-    def handle_payload(self, message):
-        """Handle external commands"""
-        self.log.debug('Received message: %s', message)
-        payload = parse_payload(message)
-        handle_command(self, payload)
+
+class SpawnWorker(Worker):
+    """Worker implementation that uses os.spawn() instead of os.fork().
+    This implementation is intended for environments where `os.fork()` is not available.
+    """
+
+    def fork_work_horse(self, job: 'Job', queue: 'Queue'):
+        """Spawns a work horse to perform the actual work using os.spawn()."""
+        os.environ['RQ_WORKER_ID'] = self.name
+        os.environ['RQ_JOB_ID'] = job.id
+        child_pid = os.spawnv(
+            os.P_NOWAIT,
+            sys.executable,
+            [
+                sys.executable,
+                '-c',
+                f"""
+import os
+import sys
+from redis import Redis
+from rq import Worker, Queue
+from rq.job import Job
+
+# Recreate worker instance
+redis = Redis(**{self.connection.connection_pool.connection_kwargs})
+worker = Worker.find_by_key("{self.key}", connection=redis)
+if not worker:
+    sys.exit(1)
+
+# Reconstruct job and queue
+job = Job.fetch("{job.id}", connection=worker.connection)
+queue = Queue("{queue.name}", connection=worker.connection)
+
+# Set up work horse
+os.setpgrp()
+worker._is_horse = True
+worker.main_work_horse(job, queue)
+""",
+            ],
+        )
+
+        self._horse_pid = child_pid
+        self.procline(f'Spawned {child_pid} at {time.time()}')
 
 
 class SimpleWorker(Worker):
     def execute_job(self, job: 'Job', queue: 'Queue'):
         """Execute job in same thread/process, do not fork()"""
-        self.set_state(WorkerStatus.BUSY)
+        self.prepare_execution(job)
         self.perform_job(job, queue)
         self.set_state(WorkerStatus.IDLE)
 
@@ -1585,7 +1799,7 @@ class HerokuWorker(Worker):
 
     def setup_work_horse_signals(self):
         """Modified to ignore SIGINT and SIGTERM and only handle SIGRTMIN"""
-        signal.signal(signal.SIGRTMIN, self.request_stop_sigrtmin)
+        signal.signal(SIGRTMIN, self.request_stop_sigrtmin)
         signal.signal(signal.SIGINT, signal.SIG_IGN)
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
@@ -1593,7 +1807,7 @@ class HerokuWorker(Worker):
         """If horse is alive send it SIGRTMIN"""
         if self.horse_pid != 0:
             self.log.info('Worker %s: warm shut down requested, sending horse SIGRTMIN signal', self.key)
-            self.kill_horse(sig=signal.SIGRTMIN)
+            self.kill_horse(sig=SIGRTMIN)
         else:
             self.log.warning('Warm shut down requested, no horse found')
 
@@ -1605,7 +1819,7 @@ class HerokuWorker(Worker):
             self.log.warning(
                 'Imminent shutdown, raising ShutDownImminentException in %d seconds', self.imminent_shutdown_delay
             )
-            signal.signal(signal.SIGRTMIN, self.request_force_stop_sigrtmin)
+            signal.signal(SIGRTMIN, self.request_force_stop_sigrtmin)
             signal.signal(signal.SIGALRM, self.request_force_stop_sigrtmin)
             signal.alarm(self.imminent_shutdown_delay)
 

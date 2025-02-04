@@ -18,7 +18,7 @@ class job:  # noqa
     def __init__(
         self,
         queue: Union['Queue', str],
-        connection: Optional['Redis'] = None,
+        connection: 'Redis',
         timeout: Optional[int] = None,
         result_ttl: int = DEFAULT_RESULT_TTL,
         ttl: Optional[int] = None,
@@ -33,7 +33,7 @@ class job:  # noqa
         on_success: Optional[Union[Callback, Callable[..., Any]]] = None,
         on_stopped: Optional[Union[Callback, Callable[..., Any]]] = None,
     ):
-        """A decorator that adds a ``delay`` method to the decorated function,
+        """A decorator that adds a ``enqueue`` method to the decorated function,
         which in turn creates a RQ job when called. Accepts a required
         ``queue`` argument that can be either a ``Queue`` instance or a string
         denoting the queue name.  For example::
@@ -45,7 +45,7 @@ class job:  # noqa
                 >>>    return x + y
                 >>> ...
                 >>> # Puts `simple_add` function into queue
-                >>> simple_add.delay(1, 2)
+                >>> simple_add.enqueue(1, 2)
 
         Args:
             queue (Union['Queue', str]): The queue to use, can be the Queue class itself, or the queue name (str)
@@ -56,9 +56,9 @@ class job:  # noqa
             queue_class (Optional[Queue], optional): A custom class that inherits from `Queue`. Defaults to None.
             depends_on (Optional[List[Any]], optional): A list of dependents jobs. Defaults to None.
             at_front (Optional[bool], optional): Whether to enqueue the job at front of the queue. Defaults to None.
-            meta (Optional[Dict[Any, Any]], optional): Arbitraty metadata about the job. Defaults to None.
+            meta (Optional[Dict[Any, Any]], optional): Arbitrary metadata about the job. Defaults to None.
             description (Optional[str], optional): Job description. Defaults to None.
-            failure_ttl (Optional[int], optional): Failture time to live. Defaults to None.
+            failure_ttl (Optional[int], optional): Failure time to live. Defaults to None.
             retry (Optional[Retry], optional): A Retry object. Defaults to None.
             on_failure (Optional[Union[Callback, Callable[..., Any]]], optional): Callable to run on failure. Defaults
                 to None.
@@ -120,5 +120,6 @@ class job:  # noqa
                 on_stopped=self.on_stopped,
             )
 
-        f.delay = delay
+        f.delay = delay  # TODO: Remove this in 3.0
+        f.enqueue = delay
         return f

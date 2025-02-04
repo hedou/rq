@@ -6,7 +6,9 @@ import signal
 import time
 from enum import Enum
 from multiprocessing import Process
-from typing import Dict, List, NamedTuple, Optional, Type, Union
+
+# TODO: Change import path to "collections.abc" after we stop supporting Python 3.8
+from typing import TYPE_CHECKING, Dict, Iterable, List, NamedTuple, Optional, Type, Union
 from uuid import uuid4
 
 from redis import ConnectionPool, Redis
@@ -20,6 +22,9 @@ from .logutils import setup_loghandlers
 from .queue import Queue
 from .utils import parse_names
 from .worker import BaseWorker, Worker
+
+if TYPE_CHECKING:
+    from rq.serializers import Serializer
 
 
 class WorkerData(NamedTuple):
@@ -36,11 +41,11 @@ class WorkerPool:
 
     def __init__(
         self,
-        queues: List[Union[str, Queue]],
+        queues: Iterable[Union[str, Queue]],
         connection: Redis,
         num_workers: int = 1,
         worker_class: Type[BaseWorker] = Worker,
-        serializer: Type[DefaultSerializer] = DefaultSerializer,
+        serializer: Type['Serializer'] = DefaultSerializer,
         job_class: Type[Job] = Job,
         *args,
         **kwargs,
@@ -57,7 +62,7 @@ class WorkerPool:
         self._sleep: int = 0
         self.status: self.Status = self.Status.IDLE  # type: ignore
         self.worker_class: Type[BaseWorker] = worker_class
-        self.serializer: Type[DefaultSerializer] = serializer
+        self.serializer: Type['Serializer'] = serializer
         self.job_class: Type[Job] = job_class
 
         # A dictionary of WorkerData keyed by worker name
@@ -141,19 +146,15 @@ class WorkerPool:
                 for i in range(delta):
                     self.start_worker(burst=self._burst, _sleep=self._sleep)
 
-    def start_worker(
+    def get_worker_process(
         self,
-        count: Optional[int] = None,
-        burst: bool = True,
+        name: str,
+        burst: bool,
         _sleep: float = 0,
-        logging_level: str = "INFO",
-    ):
-        """
-        Starts a worker and adds the data to worker_datas.
-        * sleep: waits for X seconds before creating worker, for testing purposes
-        """
-        name = uuid4().hex
-        process = Process(
+        logging_level: str = 'INFO',
+    ) -> Process:
+        """Returns the worker process"""
+        return Process(
             target=run_worker,
             args=(name, self._queue_names, self._connection_class, self._pool_class, self._pool_kwargs),
             kwargs={
@@ -166,12 +167,26 @@ class WorkerPool:
             },
             name=f'Worker {name} (WorkerPool {self.name})',
         )
+
+    def start_worker(
+        self,
+        count: Optional[int] = None,
+        burst: bool = True,
+        _sleep: float = 0,
+        logging_level: str = 'INFO',
+    ):
+        """
+        Starts a worker and adds the data to worker_datas.
+        * sleep: waits for X seconds before creating worker, for testing purposes
+        """
+        name = uuid4().hex
+        process = self.get_worker_process(name, burst=burst, _sleep=_sleep, logging_level=logging_level)
         process.start()
         worker_data = WorkerData(name=name, pid=process.pid, process=process)  # type: ignore
         self.worker_dict[name] = worker_data
         self.log.debug('Spawned worker: %s with PID %d', name, process.pid)
 
-    def start_workers(self, burst: bool = True, _sleep: float = 0, logging_level: str = "INFO"):
+    def start_workers(self, burst: bool = True, _sleep: float = 0, logging_level: str = 'INFO'):
         """
         Run the workers
         * sleep: waits for X seconds before creating worker, only for testing purposes
@@ -201,12 +216,12 @@ class WorkerPool:
         for worker_data in worker_datas:
             self.stop_worker(worker_data)
 
-    def start(self, burst: bool = False, logging_level: str = "INFO"):
+    def start(self, burst: bool = False, logging_level: str = 'INFO'):
         self._burst = burst
         respawn = not burst  # Don't respawn workers if burst mode is on
         setup_loghandlers(logging_level, DEFAULT_LOGGING_DATE_FORMAT, DEFAULT_LOGGING_FORMAT, name=__name__)
         self.log.info(f'Starting worker pool {self.name} with pid %d...', os.getpid())
-        self.status = self.Status.IDLE
+        self.status = self.Status.STARTED
         self.start_workers(burst=self._burst, logging_level=logging_level)
         self._install_signal_handlers()
         while True:
@@ -229,15 +244,15 @@ class WorkerPool:
 
 def run_worker(
     worker_name: str,
-    queue_names: List[str],
+    queue_names: Iterable[str],
     connection_class,
     connection_pool_class,
     connection_pool_kwargs: dict,
     worker_class: Type[BaseWorker] = Worker,
-    serializer: Type[DefaultSerializer] = DefaultSerializer,
+    serializer: Type['Serializer'] = DefaultSerializer,
     job_class: Type[Job] = Job,
     burst: bool = True,
-    logging_level: str = "INFO",
+    logging_level: str = 'INFO',
     _sleep: int = 0,
 ):
     connection = connection_class(
@@ -245,6 +260,6 @@ def run_worker(
     )
     queues = [Queue(name, connection=connection) for name in queue_names]
     worker = worker_class(queues, name=worker_name, connection=connection, serializer=serializer, job_class=job_class)
-    worker.log.info("Starting worker started with PID %s", os.getpid())
+    worker.log.info('Starting worker started with PID %s', os.getpid())
     time.sleep(_sleep)
-    worker.work(burst=burst, logging_level=logging_level)
+    worker.work(burst=burst, with_scheduler=True, logging_level=logging_level)
